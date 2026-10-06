@@ -1,0 +1,49 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="/style.css"></head><body><div id="v">Loading…</div><nav id="n"></nav>
+<script>
+const tg=Telegram.WebApp,V=document.getElementById('v'),N=document.getElementById('n');tg.ready();tg.expand();
+let S=null,tab=null,newKey=null;const sel=new Set();
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const m=c=>'$'+(c/100).toFixed(2),val=id=>document.getElementById(id).value;
+const ids=a=>a.services||(a.service?[a.service]:[]);
+const support=()=>{try{tg.openTelegramLink('https://t.me/nyrixTG')}catch(_){tg.openLink('https://t.me/nyrixTG')}};
+async function call(p,o={}){const r=await fetch(p,{...o,headers:{'X-Init':tg.initData,...(o.headers||{})}});
+ const j=await r.json().catch(()=>({error:'Server error'}));if(!r.ok)throw Error(j.error||'Error');return j}
+async function act(d){try{const j=await call('/api/act',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
+ S=j;if(j.key)newKey=j.key;if(j.msg)tg.showAlert(j.msg);if(j.url)tg.openLink(j.url);draw();return true}catch(e){tg.showAlert(e.message);return false}}
+async function send(id){const fd=new FormData();fd.append('order',id);fd.append('text',val('t'+id));const f=document.getElementById('f'+id).files[0];if(f)fd.append('file',f);
+ try{S=await call('/api/deliver',{method:'POST',body:fd});draw();tg.showAlert('Sent ✅')}catch(e){tg.showAlert(e.message)}}
+const pick=i=>{sel.has(i)?sel.delete(i):sel.add(i);draw()};
+async function addAuto(){if(await act({a:'auto',op:'add',services:[...sel]})){sel.clear();draw()}}
+async function editSvc(id){
+ const nameEl=document.getElementById('en_'+id),priceEl=document.getElementById('ep_'+id);
+ if(!nameEl||!priceEl)return;
+ const name=nameEl.value.trim(),price=priceEl.value;
+ if(!name){tg.showAlert('Name required');return}
+ await act({a:'editsvc',id,name,price});
+}
+function tabs(){const t=[];if(S.user)t.push(['shop','Shop'],['auto','Auto'],['ord','Orders']);if(S.owner)t.push(['adm','Admin']);return t}
+function draw(){const t=tabs();
+ const navSupport=`<button type="button" onclick="support()">Support</button>`;
+ if(!t.length){N.innerHTML=navSupport;V.innerHTML=`<div class="card hero"><h2>Activate your account</h2><p class=hint>Enter the secret key you received from the owner.</p><input id=k placeholder="sk_…" autocomplete=off><button onclick="act({a:'key',key:val('k')})">Activate</button></div><div class="card row"><span class=hint>Need help?</span><button class=g type="button" onclick="support()">Support</button></div>`;return}
+ if(!tab||!t.some(x=>x[0]==tab))tab=t[0][0];
+ N.innerHTML=t.map(x=>`<button class="${x[0]==tab?'on':''}" onclick="tab='${x[0]}';draw()">${x[1]}</button>`).join('')+navSupport;
+ const sv=Object.entries(S.services);let h='';
+ const chips=sv.map(([i,s])=>`<button class="chip ${sel.has(i)?'on':''}" data-id="${esc(i)}" onclick="pick(this.dataset.id)">${esc(s.name)} · ${m(s.price)}</button>`).join('');
+ if(tab=='shop')h=`<div class="card hero"><div class=hint>Balance</div><div class=big>${m(S.user.balance)}</div><div class=row style="margin-top:8px"><input id=amt type=number min=1 placeholder="Amount (USD)" style="flex:1"><button onclick="act({a:'deposit',amount:val('amt')})">Deposit</button></div><div class=hint>Pay with crypto through Heleket. Your balance updates automatically.</div></div>`+
+  (sv.map(([i,s])=>`<div class="card row"><div><b>${esc(s.name)}</b><div class=hint>${esc(i)} · ${m(s.price)}/session</div></div><button data-id="${esc(i)}" onclick="act({a:'buy',service:this.dataset.id})">Buy</button></div>`).join('')||'<p class=hint>No services yet.</p>');
+ if(tab=='auto'){const tot=[...sel].reduce((a,i)=>a+(S.services[i]?.price||0),0);
+  h=`<div class="card hero"><h2>New automation</h2><div class=hint>Pick one or more services. They run nonstop, all day, until you pause or delete the automation.</div><div class=chips>${chips||'<span class=hint>No services yet.</span>'}</div><div class=row><span class=hint>${sel.size?`${sel.size} selected · ${m(tot)} per cycle`:'Nothing selected'}</span><button onclick="addAuto()" ${sel.size?'':'disabled'}>Start automation</button></div><div class=hint style="margin-top:8px">If your balance runs short, the automation pauses and you get a message.</div></div>`+
+  (S.user.autos.map((a,i)=>`<div class="card row"><div><b>${ids(a).map(x=>esc(S.services[x]?.name||x)).join(' + ')}</b><div class=hint><span class="pill ${a.on?'on':''}">${a.on?'Running':'Paused'}</span> ${m(ids(a).reduce((s,x)=>s+(S.services[x]?.price||0),0))} per cycle</div></div><div><button class=g onclick="act({a:'auto',op:'toggle',i:${i}})">${a.on?'Pause':'Resume'}</button> <button class=d onclick="act({a:'auto',op:'del',i:${i}})">Delete</button></div></div>`).join('')||'<p class=hint>No automations yet.</p>')}
+ if(tab=='ord')h=S.orders.map(o=>`<div class="card row"><div><b>${o.hide_number?'':('#'+o.id+' ')}${esc(o.name)}</b><div class=hint>${m(o.charged||o.price)}${o.sessions!=null?' · '+o.sessions+' sess':''}</div></div><span class=pill>${esc(o.status)}</span></div>`).join('')||'<p class=hint>No orders yet.</p>';
+ if(tab=='adm')h=`<div class="card hero"><h2>Create key</h2><input id=kn placeholder="Buyer name"><button onclick="act({a:'newkey',name:val('kn')})">Generate</button>${newKey?`<p>Copy and send now (shown once):<br><code>${esc(newKey)}</code></p>`:''}<div class=hint style="margin-top:8px">${S.keys.map(k=>esc(k.name)+(k.user?' ✓':' …')).join(' · ')}</div></div>`+
+  `<div class=card><h2>Add funds</h2><input id=fk placeholder="Buyer's secret key (sk_…)" autocomplete=off><input id=fa type=number min=0.01 step=any placeholder="Amount (USD)"><button onclick="act({a:'addfunds',key:val('fk'),amount:val('fa')})">Add to balance</button><div class=hint style="margin-top:6px">The buyer must have activated the key. They get a message when funds land.</div></div>`+
+  `<div class=card><h2>Pending orders</h2>${S.pending.length?'':'<span class=hint>Nothing waiting.</span>'}</div>`+S.pending.map(o=>`<div class=card><div class=row><b>${o.hide_number?'Batch':('#'+o.id)} ${esc(o.name)}</b><span class=hint>${esc(o.buyer||'')} · ${m(o.price)}</span></div><textarea id="t${o.id}" placeholder="Reply text (optional)"></textarea><input id="f${o.id}" type=file><div class=row><button onclick="send('${esc(o.id)}')">Send to buyer</button><button class=d onclick="tg.showConfirm('Refund ${esc(String(o.id))}?',y=>y&&act({a:'refund',id:'${esc(String(o.id))}'}))">Refund</button></div></div>`).join('')+
+  `<div class=card><h2>Services</h2>`+
+  (sv.map(([i,s])=>`<div class=card style="margin:8px 0;padding:10px"><div class=hint style="margin-bottom:6px">ID: <b>${esc(i)}</b></div><input id="en_${esc(i)}" value="${esc(s.name)}" placeholder="Name"><input id="ep_${esc(i)}" type=number step=any min=0 value="${(s.price/100).toFixed(2)}" placeholder="Price USD"><div class=row style="margin-top:6px"><button data-id="${esc(i)}" onclick="editSvc(this.dataset.id)">Save</button><button class=d data-id="${esc(i)}" onclick="act({a:'delsvc',id:this.dataset.id})">Delete</button></div></div>`).join('')||'<span class=hint>No services yet.</span>')+
+  `<h2 style="margin-top:14px">Add service</h2><input id=si placeholder="ID (e.g. s1)"><input id=sn placeholder="Name"><input id=sp type=number step=any placeholder="Price USD"><button onclick="act({a:'addsvc',id:val('si'),name:val('sn'),price:val('sp')})">Add service</button></div>`;
+ V.innerHTML=h}
+act({a:'me'});
+</script></body></html>
