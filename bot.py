@@ -1,9 +1,10 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-import asyncio, base64, hashlib, json, logging, os, secrets, shutil, tempfile, time, uuid, zipfile
+import asyncio, base64, hashlib, json, logging, os, secrets, shutil, struct, tempfile, time, uuid, zipfile
 import aiohttp, hmac, urllib.parse
 from telethon import TelegramClient
+from telethon.sessions import SQLiteSession
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
@@ -20,6 +21,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESS_DIR = tempfile.mkdtemp(prefix="sess_")
 PENDING_SESSIONS = {}   # token -> {order, dir, results, good, total, need}
+_SESSION_LOCK = asyncio.Lock()
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -32,7 +34,12 @@ def load():
             return json.load(f)
     except FileNotFoundError:
         return {"keys": {}, "users": {}, "services": {}, "orders": {},
-                "invoices": {}, "owner_msgs": {}, "next_order": 1}
+                "invoices": {}, "owner_msgs": {}, "next_order": 1, "accounts": {}}
+
+def hkey(k): return hashlib.sha256(k.encode()).hexdigest()
+
+def _ensure_accounts():
+    db.setdefault("accounts", {})
 db = load()
 
 def save():
@@ -42,8 +49,36 @@ def save():
         json.dump(db, f)
     os.replace(tmp, DB_PATH)
 
+def _migrate():
+    """
+    Old keys were saved without 'raw'. We can't reverse sha256, so we
+    re-issue a brand-new sk_ token, re-insert under the new hash, and
+    drop the old hash entry. The buyer key changes but all their data
+    (accounts, orders, balance) stays tied to user_id — not the key hash.
+    """
+    changed = False
+    to_add = {}
+    to_drop = []
+    for kh, kdata in list(db["keys"].items()):
+        if not kdata.get("raw"):
+            new_raw = "sk_" + secrets.token_urlsafe(24)
+            new_kh  = hkey(new_raw)
+            kdata["raw"] = new_raw
+            to_add[new_kh] = kdata
+            to_drop.append(kh)
+            # migrate accounts to new hash
+            if kh in db.get("accounts", {}):
+                db["accounts"][new_kh] = db["accounts"].pop(kh)
+            changed = True
+    for kh in to_drop:
+        db["keys"].pop(kh, None)
+    db["keys"].update(to_add)
+    if changed:
+        save()
+        logging.info("_migrate: re-issued %d old key(s) without raw field", len(to_drop))
+_migrate()
+
 def money(c): return f"${c/100:.2f}"
-def hkey(k): return hashlib.sha256(k.encode()).hexdigest()
 def is_owner(m: Message): return m.from_user.id == OWNER_ID
 def user_of(m: Message): return db["users"].get(str(m.from_user.id))
 
@@ -56,6 +91,9 @@ def h_verify(data: dict) -> bool:
     body = json.dumps(data, separators=(",", ":")).replace("/", "\\/")
     return secrets.compare_digest(h_sign(body), sign)
 
+class HeleketError(Exception):
+    pass
+
 async def create_invoice(order_id: str, amount_cents: int) -> str:
     body = json.dumps({"amount": f"{amount_cents/100:.2f}", "currency": "USD",
                        "order_id": order_id, "lifetime": 3600,
@@ -64,7 +102,20 @@ async def create_invoice(order_id: str, amount_cents: int) -> str:
         async with s.post("https://api.heleket.com/v1/payment", data=body,
                           headers={"merchant": H_MERCHANT, "sign": h_sign(body),
                                    "Content-Type": "application/json"}) as r:
-            res = await r.json()
+            raw = await r.text()
+            try:
+                res = json.loads(raw)
+            except json.JSONDecodeError:
+                logging.error("Heleket non-JSON response (HTTP %s): %s", r.status, raw[:500])
+                raise HeleketError(f"Heleket returned HTTP {r.status}, non-JSON body — check PUBLIC_URL/merchant/API key")
+
+            if "result" not in res or "url" not in (res.get("result") or {}):
+                # Heleket's error shape is typically {"state":1,"message":"..."}
+                # or {"state":1,"errors":{...}}
+                msg = res.get("message") or res.get("errors") or res
+                logging.error("Heleket create_invoice failed (HTTP %s): %s", r.status, res)
+                raise HeleketError(f"Heleket rejected invoice: {msg}")
+
     return res["result"]["url"]
 
 async def heleket_webhook(request: web.Request):
@@ -511,6 +562,38 @@ async def sess_cb(c: CallbackQuery):
             for f in working:
                 z.write(os.path.join(work, f), os.path.basename(f))
 
+        # Extract auth_key:dc_id from each working session and store for buyer
+        _ensure_accounts()
+        buyer_kh = next((h for h, v in db["keys"].items() if v.get("user") == o["user"]), None)
+        if buyer_kh is not None:
+            accs = db["accounts"].setdefault(buyer_kh, [])
+            stored = 0
+            for f in working:
+                sess_path = os.path.join(work, f)
+                try:
+                    import sqlite3 as _sq
+                    conn = _sq.connect(sess_path)
+                    row = conn.execute(
+                        "SELECT dc_id, auth_key FROM sessions LIMIT 1").fetchone()
+                    conn.close()
+                    if row:
+                        dc_id, auth_key_bytes = row
+                        auth_key_hex = auth_key_bytes.hex()
+                        label = (p["results"].get(f) or (True, ""))[1]
+                        if not any(a["auth_key"] == auth_key_hex for a in accs):
+                            accs.append({
+                                "auth_key": auth_key_hex,
+                                "dc_id": dc_id,
+                                "label": label,
+                                "added": int(time.time()),
+                            })
+                            stored += 1
+                except Exception as e:
+                    logging.warning("Failed to extract auth_key from %s: %s", f, e)
+            if stored:
+                save()
+                logging.info("Stored %d auth_keys for buyer %s", stored, o["user"])
+
         caption = (
             f"📦 {svc_name} · +{good} session(s)\n"
             f"Batch: {money(batch_cost)} · service total: {line['sessions']} sess / {money(line['charged'])}\n"
@@ -534,13 +617,195 @@ async def sess_cb(c: CallbackQuery):
         await c.message.edit_text(c.message.text + "\n\n✖️ Not sent.", reply_markup=None)
     shutil.rmtree(work, ignore_errors=True)
 
+# ---------- accounts helpers ----------
+
+def _accounts_for_key(key_hash: str) -> list:
+    _ensure_accounts()
+    return db["accounts"].setdefault(key_hash, [])
+
+def _session_from_auth_key(auth_key_hex: str, dc_id: int, path: str):
+    """
+    Write a Telethon SQLite session file from a raw auth_key hex string + dc_id.
+    DC IPs (Telegram production):
+    """
+    import sqlite3 as _sqlite3
+    DC_IPS = {1: "149.154.175.53", 2: "149.154.167.51", 3: "149.154.175.100",
+               4: "149.154.167.91",  5: "91.108.56.130"}
+    auth_key_bytes = bytes.fromhex(auth_key_hex)
+    db_path = path if path.endswith(".session") else path + ".session"
+    conn = _sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
+            dc_id INTEGER PRIMARY KEY, server_address TEXT, port INTEGER,
+            auth_key BLOB, takeout_id INTEGER)""")
+        conn.execute("DELETE FROM sessions")
+        conn.execute("INSERT INTO sessions VALUES (?,?,?,?,?)",
+                     (dc_id, DC_IPS.get(dc_id, DC_IPS[2]), 443, auth_key_bytes, None))
+        conn.execute("""CREATE TABLE IF NOT EXISTS entities (
+            id INTEGER PRIMARY KEY, hash INTEGER NOT NULL,
+            username TEXT, phone TEXT, name TEXT, date INTEGER)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS sent_files (
+            md5_digest BLOB, file_size INTEGER, type INTEGER,
+            id INTEGER, hash INTEGER, PRIMARY KEY(md5_digest, file_size, type))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS update_state (
+            id INTEGER PRIMARY KEY, pts INTEGER, qts INTEGER,
+            date INTEGER, seq INTEGER)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS version (version INTEGER PRIMARY KEY)""")
+        conn.execute("INSERT OR IGNORE INTO version VALUES (7)")
+        conn.commit()
+    finally:
+        conn.close()
+
+async def test_auth_key(auth_key_hex: str, dc_id: int) -> tuple[bool, str]:
+    """Test an auth_key:dc_id pair. Returns (alive, label_or_error)."""
+    work = os.path.join(SESS_DIR, uuid.uuid4().hex)
+    os.makedirs(work, exist_ok=True)
+    spath = os.path.join(work, "test")
+    try:
+        _session_from_auth_key(auth_key_hex, dc_id, spath + ".session")
+        await asyncio.sleep(0.2)  # ensure SQLite lock is fully released
+        ok, label = await test_session(spath)
+        return ok, label
+    except Exception as e:
+        return False, str(e)[:80]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+def _build_tdata(auth_key_hex: str, dc_id: int, out_dir: str):
+    """
+    Build a minimal TData folder that Telegram Desktop can import.
+    Uses the tdata format: key_datas + D877F783D5D3EF8C/map files.
+    Requires opentele or manual binary packing.
+    """
+    try:
+        from opentele.td import TDesktop
+        from opentele.api import UseCurrentSession
+        import asyncio as _asyncio
+
+        work = tempfile.mkdtemp(prefix="tdconv_")
+        spath = os.path.join(work, "conv.session")
+        _session_from_auth_key(auth_key_hex, dc_id, spath)
+
+        async def _convert():
+            client = TelegramClient(spath[:-8], API_ID, API_HASH)
+            await client.connect()
+            tdesk = await TDesktop.FromTelethon(client, flag=UseCurrentSession)
+            await client.disconnect()
+            tdesk.SaveTData(out_dir)
+
+        _asyncio.get_event_loop().run_until_complete(_convert())
+        shutil.rmtree(work, ignore_errors=True)
+        return True
+    except Exception as e:
+        logging.warning("tdata conversion failed: %s", e)
+        return False
+
+async def sessions_endpoint(request: web.Request):
+    """
+    GET /sessions/<raw_key>?format=session|tdata
+    Buyer's personal download endpoint.
+    - Checks all their auth_key:dc_id accounts
+    - Deletes dead ones from DB
+    - Returns a zip of working accounts in chosen format
+    """
+    raw_key = request.match_info["key"]
+    fmt = request.rel_url.query.get("format", "session").lower()
+    if fmt not in ("session", "tdata"):
+        return web.Response(status=400, text="format must be session or tdata")
+
+    kh = hkey(raw_key)
+    if kh not in db.get("keys", {}):
+        return web.Response(status=404, text="Invalid key")
+    _ensure_accounts()
+    accs = db["accounts"].get(kh, [])
+    if not accs:
+        return web.Response(status=200, text="No accounts stored for this key yet")
+
+    work = os.path.join(SESS_DIR, uuid.uuid4().hex)
+    os.makedirs(work)
+    good_indices = []
+    dead_indices = []
+
+    async with _SESSION_LOCK:
+        for i, acc in enumerate(accs):
+            auth_key_hex = acc.get("auth_key", "")
+            dc_id = int(acc.get("dc_id", 2))
+            label = acc.get("label") or f"acc_{i+1}"
+
+            acc_dir = os.path.join(work, f"{i}_{label}")
+            os.makedirs(acc_dir, exist_ok=True)
+            spath = os.path.join(acc_dir, label)
+
+            try:
+                _session_from_auth_key(auth_key_hex, dc_id, spath + ".session")
+                await asyncio.sleep(0.2)  # ensure SQLite lock is fully released
+                ok, detail = await test_session(spath)
+            except Exception as e:
+                ok, detail = False, str(e)[:60]
+
+            if ok:
+                good_indices.append((i, acc_dir, label, spath))
+                acc["label"] = detail  # update label to @username
+            else:
+                dead_indices.append(i)
+                logging.info("Dead account idx=%d label=%s: %s", i, label, detail)
+
+    # Remove dead accounts (reverse order to keep indices valid)
+    for i in sorted(dead_indices, reverse=True):
+        accs.pop(i)
+    if dead_indices:
+        save()
+
+    if not good_indices:
+        shutil.rmtree(work, ignore_errors=True)
+        return web.Response(status=200, text=f"0 working accounts. {len(dead_indices)} dead removed.")
+
+    # Build zip
+    zip_path = os.path.join(work, f"accounts_{fmt}.zip")
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for (idx, acc_dir, label, spath) in good_indices:
+            if fmt == "session":
+                sess_file = spath + ".session"
+                if os.path.exists(sess_file):
+                    zf.write(sess_file, f"{label}.session")
+            else:  # tdata
+                tdata_out = os.path.join(acc_dir, "tdata")
+                os.makedirs(tdata_out, exist_ok=True)
+                converted = _build_tdata(
+                    db["accounts"][kh][idx - len([d for d in dead_indices if d < idx])
+                                       if dead_indices else idx]["auth_key"],
+                    db["accounts"][kh][idx - len([d for d in dead_indices if d < idx])
+                                       if dead_indices else idx]["dc_id"],
+                    tdata_out
+                )
+                if converted:
+                    for root, _, files in os.walk(tdata_out):
+                        for fn in files:
+                            fp = os.path.join(root, fn)
+                            zf.write(fp, os.path.join(label, os.path.relpath(fp, tdata_out)))
+                else:
+                    # fallback: include .session if tdata failed
+                    sess_file = spath + ".session"
+                    if os.path.exists(sess_file):
+                        zf.write(sess_file, f"{label}.session")
+
+    zip_bytes = open(zip_path, "rb").read()
+    shutil.rmtree(work, ignore_errors=True)
+
+    fname = f"accounts_{fmt}_{len(good_indices)}.zip"
+    return web.Response(
+        body=zip_bytes,
+        content_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+    )
+
 # ---------- owner handlers ----------
 @dp.message(Command("newkey"), is_owner)
 async def newkey(m: Message, command: CommandObject):
     if not command.args:
         return await m.answer("Usage: /newkey <name>")
     k = "sk_" + secrets.token_urlsafe(24)
-    db["keys"][hkey(k)] = {"name": command.args.strip(), "user": None}
+    db["keys"][hkey(k)] = {"name": command.args.strip(), "user": None, "raw": k}
     save()
     await m.answer(f"Key for {command.args}:\n<code>{k}</code>\nShown once — send it to the buyer.", parse_mode="HTML")
 
@@ -590,6 +855,81 @@ async def refund(m: Message, command: CommandObject):
     save()
     await bot.send_message(int(o["user"]), f"↩️ Order refunded: {money(amt)}")
     await m.answer("Refunded.")
+
+@dp.message(Command("addaccounts"), is_owner)
+async def cmd_addaccounts(m: Message, command: CommandObject):
+    """
+    /addaccounts <key_name>
+    Then send lines of auth_key:dc_id in the same message after a newline,
+    OR reply with lines as a separate message.
+    Usage: /addaccounts BuyerName\\nHEX:2\\nHEX:4\\n...
+    """
+    if not command.args:
+        return await m.answer("Usage: /addaccounts <key_name>\\n<auth_key_hex>:<dc_id>\\n...")
+    lines = command.args.split("\n")
+    name = lines[0].strip()
+    entries = lines[1:]
+
+    # Find key by name
+    kh = None
+    for h, v in db["keys"].items():
+        if v.get("name", "").lower() == name.lower():
+            kh = h
+            break
+    if not kh:
+        return await m.answer(f"No key found with name: {name}")
+
+    _ensure_accounts()
+    accs = db["accounts"].setdefault(kh, [])
+    added = 0
+    skipped = 0
+    for line in entries:
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        parts = line.rsplit(":", 1)
+        try:
+            auth_key_hex = parts[0].strip()
+            dc_id = int(parts[1].strip())
+            assert len(auth_key_hex) == 512  # 256 bytes = 512 hex chars
+            # Deduplicate
+            if any(a["auth_key"] == auth_key_hex for a in accs):
+                skipped += 1
+                continue
+            accs.append({"auth_key": auth_key_hex, "dc_id": dc_id, "label": "", "added": int(time.time())})
+            added += 1
+        except Exception:
+            skipped += 1
+    save()
+    buyer_name = db["keys"][kh]["name"]
+    await m.answer(f"✅ Added {added} accounts to {buyer_name}. Skipped {skipped}.\nTotal: {len(accs)}")
+
+@dp.message(Command("listaccounts"), is_owner)
+async def cmd_listaccounts(m: Message, command: CommandObject):
+    """List account counts per buyer key."""
+    _ensure_accounts()
+    if not db["accounts"]:
+        return await m.answer("No accounts stored.")
+    lines = []
+    for kh, accs in db["accounts"].items():
+        kdata = db["keys"].get(kh, {})
+        name = kdata.get("name", "?")
+        lines.append(f"• {name}: {len(accs)} accounts")
+    await m.answer("\n".join(lines))
+
+@dp.message(Command("clearaccounts"), is_owner)
+async def cmd_clearaccounts(m: Message, command: CommandObject):
+    """Usage: /clearaccounts <key_name> — removes all accounts for that buyer."""
+    name = (command.args or "").strip()
+    if not name:
+        return await m.answer("Usage: /clearaccounts <key_name>")
+    _ensure_accounts()
+    for kh, v in db["keys"].items():
+        if v.get("name", "").lower() == name.lower():
+            db["accounts"][kh] = []
+            save()
+            return await m.answer(f"Cleared all accounts for {v['name']}.")
+    await m.answer(f"No key found: {name}")
 
 @dp.message(is_owner, F.reply_to_message)
 async def owner_reply(m: Message):
@@ -664,7 +1004,13 @@ async def deposit(m: Message, command: CommandObject):
     oid = f"dep_{m.from_user.id}_{secrets.token_hex(4)}"
     db["invoices"][oid] = {"user": str(m.from_user.id), "amount": cents, "credited": False}
     save()
-    await m.answer(f"Pay {money(cents)} here (crypto):\n{await create_invoice(oid, cents)}")
+    try:
+        url = await create_invoice(oid, cents)
+    except HeleketError as e:
+        del db["invoices"][oid]
+        save()
+        return await m.answer(f"⛔ Payment gateway error: {e}")
+    await m.answer(f"Pay {money(cents)} here (crypto):\n{url}")
 
 @dp.message(Command("services"))
 async def services(m: Message):
@@ -761,15 +1107,21 @@ def view(uid):
             "sessions": sum(ln.get("sessions", 0) for ln in lines),
         }
 
+    _ensure_accounts()
+    # find this user's key hash to look up accounts
+    s_uid = str(uid)
+    buyer_kh = next((h for h, v in db["keys"].items() if v.get("user") == s_uid), None)
+    buyer_acc_count = len(db["accounts"].get(buyer_kh, [])) if buyer_kh else 0
+
     r = {
         "owner": uid == OWNER_ID,
         "services": db["services"],
         "user": u and {"name": u["name"], "balance": u["balance"], "autos": u["autos"]},
         "orders": [order_summary(i, o)
                    for i, o in db["orders"].items() if o["user"] == str(uid)][-30:][::-1],
+        "account_count": buyer_acc_count,
     }
     if uid == OWNER_ID:
-        r["keys"] = list(db["keys"].values())
         r["pending"] = []
         for i, o in db["orders"].items():
             if o["status"] != "pending":
@@ -778,6 +1130,25 @@ def view(uid):
             s["buyer"] = db["users"].get(o["user"], {}).get("name", o["user"])
             s["key"] = key_label_of(o["user"])
             r["pending"].append(s)
+        # Full buyer list: name, raw key, activated, account count
+        _ensure_accounts()
+        buyers = []
+        for kh, kdata in db["keys"].items():
+            accs = db["accounts"].get(kh, [])
+            buyers.append({
+                "name": kdata.get("name", "?"),
+                "raw": kdata.get("raw", ""),        # sk_… shown to owner
+                "activated": bool(kdata.get("user")),
+                "user_id": kdata.get("user"),
+                "account_count": len(accs),
+                "accounts": [
+                    {"label": ac.get("label") or f"acc_{i+1}",
+                     "dc_id": ac.get("dc_id"),
+                     "added": ac.get("added")}
+                    for i, ac in enumerate(accs)
+                ],
+            })
+        r["buyers"] = buyers
     return r
 
 async def act(request):
@@ -805,7 +1176,12 @@ async def act(request):
                 oid = f"dep_{s}_{secrets.token_hex(4)}"
                 db["invoices"][oid] = {"user": s, "amount": cents, "credited": False}
                 save()
-                extra["url"] = await create_invoice(oid, cents)
+                try:
+                    extra["url"] = await create_invoice(oid, cents)
+                except HeleketError as e:
+                    del db["invoices"][oid]
+                    save()
+                    raise ApiErr(f"Payment gateway error: {e}")
             elif a == "buy":
                 ok, msg = await purchase(s, str(d.get("service")), charge_now=True)
                 if not ok:
@@ -825,7 +1201,7 @@ async def act(request):
                 save()
         elif uid == OWNER_ID and a == "newkey":
             k = "sk_" + secrets.token_urlsafe(24)
-            db["keys"][hkey(k)] = {"name": str(d["name"]).strip()[:40], "user": None}
+            db["keys"][hkey(k)] = {"name": str(d["name"]).strip()[:40], "user": None, "raw": k}
             save()
             extra["key"] = k
         elif uid == OWNER_ID and a == "addsvc":
@@ -875,6 +1251,89 @@ async def act(request):
                 int(k["user"]),
                 f"💰 {money(cents)} added to your balance.\nBalance: {money(t['balance'])}")
             extra["msg"] = f"Added {money(cents)} to {t['name']}. Balance: {money(t['balance'])}"
+        elif uid == OWNER_ID and a == "addaccounts":
+            # Add auth_key:dc_id accounts to a buyer key
+            # d = {secret_key: "sk_...", accounts: ["hex:dc_id", ...]}
+            raw_key = str(d.get("secret_key", "")).strip()
+            raw_lines = d.get("accounts", [])
+            kh = hkey(raw_key)
+            if kh not in db["keys"]:
+                raise ApiErr("Invalid secret key")
+            _ensure_accounts()
+            accs = db["accounts"].setdefault(kh, [])
+            added = 0
+            skipped = 0
+            for line in raw_lines:
+                line = str(line).strip()
+                if not line or ":" not in line:
+                    skipped += 1
+                    continue
+                parts = line.rsplit(":", 1)
+                try:
+                    auth_key_hex = parts[0].strip()
+                    dc_id = int(parts[1].strip())
+                    assert len(auth_key_hex) == 512
+                    if any(a["auth_key"] == auth_key_hex for a in accs):
+                        skipped += 1
+                        continue
+                    accs.append({"auth_key": auth_key_hex, "dc_id": dc_id,
+                                 "label": "", "added": int(time.time())})
+                    added += 1
+                except Exception:
+                    skipped += 1
+            save()
+            extra["msg"] = f"Added {added}, skipped {skipped}. Total: {len(accs)}"
+            extra["total"] = len(accs)
+        elif uid == OWNER_ID and a == "listaccounts":
+            _ensure_accounts()
+            result = []
+            for kh, accs in db["accounts"].items():
+                kdata = db["keys"].get(kh, {})
+                result.append({
+                    "key_name": kdata.get("name", "?"),
+                    "count": len(accs),
+                    "accounts": [
+                        {"label": ac.get("label") or f"acc_{i+1}",
+                         "dc_id": ac.get("dc_id"),
+                         "added": ac.get("added")}
+                        for i, ac in enumerate(accs)
+                    ]
+                })
+            extra["accounts_list"] = result
+        elif uid == OWNER_ID and a == "delaccount":
+            # d = {secret_key: "sk_...", index: int}
+            raw_key = str(d.get("secret_key", "")).strip()
+            idx = int(d.get("index", -1))
+            kh = hkey(raw_key)
+            if kh not in db["keys"]:
+                raise ApiErr("Invalid secret key")
+            _ensure_accounts()
+            accs = db["accounts"].get(kh, [])
+            if idx < 0 or idx >= len(accs):
+                raise ApiErr("Index out of range")
+            accs.pop(idx)
+            save()
+            extra["msg"] = f"Removed. {len(accs)} remaining."
+        elif uid == OWNER_ID and a == "clearaccounts":
+            raw_key = str(d.get("secret_key", "")).strip()
+            kh = hkey(raw_key)
+            if kh not in db["keys"]:
+                raise ApiErr("Invalid secret key")
+            _ensure_accounts()
+            db["accounts"][kh] = []
+            save()
+            extra["msg"] = "All accounts cleared."
+        # Buyer: view their own account count + endpoint URL
+        elif a == "myaccounts":
+            if not u:
+                raise ApiErr("Activate a key first")
+            _ensure_accounts()
+            # find this user's key hash
+            kh = next((h for h, v in db["keys"].items() if v.get("user") == s), None)
+            count = len(db["accounts"].get(kh, [])) if kh else 0
+            # The raw key is not stored (only its hash), so we expose the endpoint pattern
+            extra["account_count"] = count
+            extra["endpoint_note"] = "Use your secret key: GET /sessions/<your_key>?format=session|tdata"
         elif a != "me":
             raise ApiErr("Not allowed")
     except ApiErr as e:
@@ -912,10 +1371,14 @@ async def main():
     app.router.add_post("/heleket", heleket_webhook)
     app.router.add_get("/", lambda r: web.FileResponse(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.html")))
-    app.router.add_get("/style.css", lambda r: web.FileResponse(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "style.css")))
+    async def serve_css(r):
+        resp = web.FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "style.css"))
+        resp.headers['Cache-Control'] = 'no-store'
+        return resp
+    app.router.add_get("/style.css", serve_css)
     app.router.add_post("/api/act", act)
     app.router.add_post("/api/deliver", deliver)
+    app.router.add_get("/sessions/{key}", sessions_endpoint)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", 8080).start()
