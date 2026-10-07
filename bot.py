@@ -986,6 +986,53 @@ async def key(m: Message, command: CommandObject):
         "/settings – automation panel\n/balance",
         reply_markup=kb)
 
+@dp.message(Command("testpay"), is_owner)
+async def testpay(m: Message, command: CommandObject):
+    """
+    /testpay <uuid>  — fires a signed 'paid' webhook directly at this bot
+    for the given invoice UUID. Bypasses Heleket/Cloudflare entirely.
+    """
+    uuid_arg = (command.args or "").strip()
+    if not uuid_arg:
+        return await m.answer("Usage: /testpay <invoice_uuid>\nGet the UUID from the payment URL.")
+
+    inv = db["invoices"].get(uuid_arg)
+    if not inv:
+        return await m.answer(f"❌ Invoice not found: {uuid_arg}\nMake sure the user ran /deposit first.")
+
+    if inv["credited"]:
+        return await m.answer(f"⚠️ Invoice {uuid_arg} already credited.")
+
+    # Build and fire a signed webhook directly at ourselves
+    import aiohttp as _aiohttp
+    body_dict = {
+        "order_id": uuid_arg,
+        "currency": "USDT",
+        "network": "tron",
+        "url_callback": f"{PUBLIC_URL}/heleket",
+        "status": "paid",
+    }
+    body_nosign = json.dumps(body_dict, separators=(",", ":")).replace("/", "\\/")
+    sign = h_sign(body_nosign)
+    body_dict["sign"] = sign
+    full_body = json.dumps(body_dict, separators=(",", ":")).replace("/", "\\/")
+
+    try:
+        async with _aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{PUBLIC_URL}/heleket",
+                data=full_body.encode(),
+                headers={"Content-Type": "application/json"},
+                timeout=_aiohttp.ClientTimeout(total=10)
+            ) as r:
+                result = await r.text()
+                if r.status == 200 and result.strip() == "ok":
+                    await m.answer(f"✅ Test webhook fired for {uuid_arg}\nCheck the user's balance.")
+                else:
+                    await m.answer(f"⚠️ Bot responded HTTP {r.status}: {result}")
+    except Exception as e:
+        await m.answer(f"❌ Failed to fire webhook: {e}")
+
 @dp.message(Command("balance"))
 async def balance(m: Message):
     u = user_of(m)

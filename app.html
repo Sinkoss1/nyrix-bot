@@ -4,7 +4,7 @@
 <link rel="stylesheet" href="/style.css"></head><body><div id="v">Loading…</div><nav id="n"></nav>
 <script>
 const tg=Telegram.WebApp,V=document.getElementById('v'),N=document.getElementById('n');tg.ready();tg.expand();
-let S=null,tab=null,newKey=null;const sel=new Set();
+let S=null,tab=null,newKey=null,accTab='add';const sel=new Set();
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const m=c=>'$'+(c/100).toFixed(2),val=id=>document.getElementById(id).value;
 const ids=a=>a.services||(a.service?[a.service]:[]);
@@ -17,6 +17,20 @@ async function send(id){const fd=new FormData();fd.append('order',id);fd.append(
  try{S=await call('/api/deliver',{method:'POST',body:fd});draw();tg.showAlert('Sent ✅')}catch(e){tg.showAlert(e.message)}}
 const pick=i=>{sel.has(i)?sel.delete(i):sel.add(i);draw()};
 async function addAuto(){if(await act({a:'auto',op:'add',services:[...sel]})){sel.clear();draw()}}
+async function addAccounts(){
+ const sk=val('acc_sk').trim(),raw=val('acc_raw').trim();
+ if(!sk||!raw){tg.showAlert('Enter secret key and accounts');return}
+ const lines=raw.split('\n').map(l=>l.trim()).filter(Boolean);
+ await act({a:'addaccounts',secret_key:sk,accounts:lines});
+ document.getElementById('acc_raw').value='';
+}
+async function delAccount(sk,idx,name){
+ tg.showConfirm(`Remove account #${idx+1} from ${name}?`,async y=>{if(y)await act({a:'delaccount',secret_key:sk,index:idx})});
+}
+async function clearAccounts(sk,name){
+ tg.showConfirm(`Clear ALL accounts for ${name}?`,async y=>{if(y)await act({a:'clearaccounts',secret_key:sk})});
+}
+function copyText(t){navigator.clipboard.writeText(t).then(()=>tg.showAlert('Copied!')).catch(()=>tg.showAlert(t))}
 async function editSvc(id){
  const nameEl=document.getElementById('en_'+id),priceEl=document.getElementById('ep_'+id);
  if(!nameEl||!priceEl)return;
@@ -33,17 +47,36 @@ function draw(){const t=tabs();
  const sv=Object.entries(S.services);let h='';
  const chips=sv.map(([i,s])=>`<button class="chip ${sel.has(i)?'on':''}" data-id="${esc(i)}" onclick="pick(this.dataset.id)">${esc(s.name)} · ${m(s.price)}</button>`).join('');
  if(tab=='shop')h=`<div class="card hero"><div class=hint>Balance</div><div class=big>${m(S.user.balance)}</div><div class=row style="margin-top:8px"><input id=amt type=number min=1 placeholder="Amount (USD)" style="flex:1"><button onclick="act({a:'deposit',amount:val('amt')})">Deposit</button></div><div class=hint>Pay with crypto through Heleket. Your balance updates automatically.</div></div>`+
+  (S.account_count>0?`<div class="card"><h2>Your Accounts</h2><div class=hint style="margin-bottom:8px">You have <b>${S.account_count}</b> account(s) ready to download.</div><input id=buyer_sk placeholder="Your secret key (sk_…)" autocomplete=off style="margin-bottom:8px"><div class=row style="gap:8px;flex-wrap:wrap"><button onclick="(function(){const k=val('buyer_sk').trim();if(!k)return tg.showAlert('Enter your secret key');tg.openLink(location.origin+'/sessions/'+k)})()">Download .session zip</button><button onclick="(function(){const k=val('buyer_sk').trim();if(!k)return tg.showAlert('Enter your secret key');tg.openLink(location.origin+'/sessions/'+k+'?format=tdata')})()">Download TData zip</button></div><div class=hint style="margin-top:8px">Dead accounts are removed automatically on each download.</div></div>`:'')+
   (sv.map(([i,s])=>`<div class="card row"><div><b>${esc(s.name)}</b><div class=hint>${esc(i)} · ${m(s.price)}/session</div></div><button data-id="${esc(i)}" onclick="act({a:'buy',service:this.dataset.id})">Buy</button></div>`).join('')||'<p class=hint>No services yet.</p>');
  if(tab=='auto'){const tot=[...sel].reduce((a,i)=>a+(S.services[i]?.price||0),0);
   h=`<div class="card hero"><h2>New automation</h2><div class=hint>Pick one or more services. They run nonstop, all day, until you pause or delete the automation.</div><div class=chips>${chips||'<span class=hint>No services yet.</span>'}</div><div class=row><span class=hint>${sel.size?`${sel.size} selected · ${m(tot)} per cycle`:'Nothing selected'}</span><button onclick="addAuto()" ${sel.size?'':'disabled'}>Start automation</button></div><div class=hint style="margin-top:8px">If your balance runs short, the automation pauses and you get a message.</div></div>`+
   (S.user.autos.map((a,i)=>`<div class="card row"><div><b>${ids(a).map(x=>esc(S.services[x]?.name||x)).join(' + ')}</b><div class=hint><span class="pill ${a.on?'on':''}">${a.on?'Running':'Paused'}</span> ${m(ids(a).reduce((s,x)=>s+(S.services[x]?.price||0),0))} per cycle</div></div><div><button class=g onclick="act({a:'auto',op:'toggle',i:${i}})">${a.on?'Pause':'Resume'}</button> <button class=d onclick="act({a:'auto',op:'del',i:${i}})">Delete</button></div></div>`).join('')||'<p class=hint>No automations yet.</p>')}
- if(tab=='ord')h=S.orders.map(o=>`<div class="card row"><div><b>${o.hide_number?'':('#'+o.id+' ')}${esc(o.name)}</b><div class=hint>${m(o.charged||o.price)}${o.sessions!=null?' · '+o.sessions+' sess':''}</div></div><span class=pill>${esc(o.status)}</span></div>`).join('')||'<p class=hint>No orders yet.</p>';
- if(tab=='adm')h=`<div class="card hero"><h2>Create key</h2><input id=kn placeholder="Buyer name"><button onclick="act({a:'newkey',name:val('kn')})">Generate</button>${newKey?`<p>Copy and send now (shown once):<br><code>${esc(newKey)}</code></p>`:''}<div class=hint style="margin-top:8px">${S.keys.map(k=>esc(k.name)+(k.user?' ✓':' …')).join(' · ')}</div></div>`+
+ if(tab=='ord')h=(S.orders||[]).map(o=>`<div class="card row"><div><b>${o.hide_number?'':('#'+o.id+' ')}${esc(o.name)}</b><div class=hint>${m(o.charged||o.price)}${o.sessions!=null?' · '+o.sessions+' sess':''}</div></div><span class=pill>${esc(o.status)}</span></div>`).join('')||'<p class=hint>No orders yet.</p>';
+ if(tab=='adm'){
+  const buyers=S.buyers||[];
+  h=`<div class="card hero"><h2>Create key</h2><input id=kn placeholder="Buyer name"><button onclick="act({a:'newkey',name:val('kn')})">Generate</button>${newKey?`<p>Copy and send to buyer (shown once):<br><code onclick="copyText('${esc(newKey)}')" style="cursor:pointer">${esc(newKey)}</code></p>`:''}</div>`+
+  `<div class=card><h2>Buyers</h2>`+
+  (buyers.length?buyers.map(b=>`<div class=card style="margin:8px 0;padding:10px">
+   <div class=row><b>${esc(b.name)}</b><span class="pill ${b.activated?'on':''}">${b.activated?'Active':'Unused'}</span></div>
+   ${b.raw?`<div class=hint style="margin:4px 0;word-break:break-all"><code style="cursor:pointer" onclick="copyText('${esc(b.raw)}')">${esc(b.raw)}</code> <button style="padding:2px 8px;font-size:11px" onclick="copyText('${esc(b.raw)}')">Copy key</button></div>`:''}
+   <div class=hint style="margin:4px 0">${b.account_count} account(s) stored${b.raw?` · <span style="cursor:pointer;text-decoration:underline" onclick="copyText('${location.origin}/sessions/${esc(b.raw)}')">copy endpoint</span>`:' · <span style="opacity:.5">key not shown (old key)</span>'}</div>
+   ${(b.accounts||[]).map((a,i)=>`<div class=row style="margin-top:4px;font-size:12px"><span>${esc(a.label||'acc_'+(i+1))} · DC${a.dc_id}</span><button class=d style="padding:2px 8px" onclick="delAccount('${esc(b.raw||'')}',${i},'${esc(b.name)}')">✕</button></div>`).join('')}
+   ${b.account_count?`<button class=d style="margin-top:6px;width:100%" onclick="clearAccounts('${esc(b.raw||'')}','${esc(b.name)}')">Clear all accounts</button>`:''}
+  </div>`).join(''):'<span class=hint>No buyers yet. Generate a key above.</span>')+
+  `</div>`+
+  `<div class=card><h2>Add accounts manually</h2>
+   <input id=acc_sk placeholder="Buyer secret key (sk_…)" autocomplete=off>
+   <textarea id=acc_raw placeholder="Paste auth_key:dc_id lines, one per line&#10;e.g. 4a3f...512hex...:2&#10;7b1e...512hex...:4" rows=5 style="font-size:12px;font-family:monospace"></textarea>
+   <div class=hint style="margin:4px 0">Each line: <code>auth_key_hex:dc_id</code> — accounts are also added automatically when you deliver session zips.</div>
+   <button onclick="addAccounts()">Add accounts</button>
+  </div>`+
   `<div class=card><h2>Add funds</h2><input id=fk placeholder="Buyer's secret key (sk_…)" autocomplete=off><input id=fa type=number min=0.01 step=any placeholder="Amount (USD)"><button onclick="act({a:'addfunds',key:val('fk'),amount:val('fa')})">Add to balance</button><div class=hint style="margin-top:6px">The buyer must have activated the key. They get a message when funds land.</div></div>`+
-  `<div class=card><h2>Pending orders</h2>${S.pending.length?'':'<span class=hint>Nothing waiting.</span>'}</div>`+S.pending.map(o=>`<div class=card><div class=row><b>${o.hide_number?'Batch':('#'+o.id)} ${esc(o.name)}</b><span class=hint>${esc(o.buyer||'')} · ${m(o.price)}</span></div><textarea id="t${o.id}" placeholder="Reply text (optional)"></textarea><input id="f${o.id}" type=file><div class=row><button onclick="send('${esc(o.id)}')">Send to buyer</button><button class=d onclick="tg.showConfirm('Refund ${esc(String(o.id))}?',y=>y&&act({a:'refund',id:'${esc(String(o.id))}'}))">Refund</button></div></div>`).join('')+
+  `<div class=card><h2>Pending orders</h2>${(S.pending||[]).length?'':'<span class=hint>Nothing waiting.</span>'}</div>`+(S.pending||[]).map(o=>`<div class=card><div class=row><b>${o.hide_number?'Batch':('#'+o.id)} ${esc(o.name)}</b><span class=hint>${esc(o.buyer||'')} · ${m(o.price)}</span></div><textarea id="t${o.id}" placeholder="Reply text (optional)"></textarea><label class="filebtn" for="f${o.id}"><span>Choose File</span><em id="fn${o.id}">No file chosen</em></label><input id="f${o.id}" type=file style="display:none" onchange="document.getElementById('fn${o.id}').textContent=this.files[0]?this.files[0].name:'No file chosen'"><div class=row><button onclick="send('${esc(o.id)}')">Send to buyer</button><button class=d onclick="tg.showConfirm('Refund ${esc(String(o.id))}?',y=>y&&act({a:'refund',id:'${esc(String(o.id))}'}))">Refund</button></div></div>`).join('')+
   `<div class=card><h2>Services</h2>`+
   (sv.map(([i,s])=>`<div class=card style="margin:8px 0;padding:10px"><div class=hint style="margin-bottom:6px">ID: <b>${esc(i)}</b></div><input id="en_${esc(i)}" value="${esc(s.name)}" placeholder="Name"><input id="ep_${esc(i)}" type=number step=any min=0 value="${(s.price/100).toFixed(2)}" placeholder="Price USD"><div class=row style="margin-top:6px"><button data-id="${esc(i)}" onclick="editSvc(this.dataset.id)">Save</button><button class=d data-id="${esc(i)}" onclick="act({a:'delsvc',id:this.dataset.id})">Delete</button></div></div>`).join('')||'<span class=hint>No services yet.</span>')+
   `<h2 style="margin-top:14px">Add service</h2><input id=si placeholder="ID (e.g. s1)"><input id=sn placeholder="Name"><input id=sp type=number step=any placeholder="Price USD"><button onclick="act({a:'addsvc',id:val('si'),name:val('sn'),price:val('sp')})">Add service</button></div>`;
+ }
  V.innerHTML=h}
 act({a:'me'});
 </script></body></html>
